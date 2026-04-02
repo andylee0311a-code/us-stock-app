@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { TrendingUp, TrendingDown, RefreshCcw, Clock, AlertTriangle, Activity } from 'lucide-react';
+import { TrendingUp, TrendingDown, RefreshCcw, Clock, AlertTriangle, Activity, Sparkles, Bot } from 'lucide-react';
 
 // 定義四大指數的代號與名稱
 const INDICES = [
@@ -16,38 +16,76 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState(null);
   const [isAutoRefresh, setIsAutoRefresh] = useState(true);
   const [usingMockData, setUsingMockData] = useState(false);
+  
+  // Gemini API 設定與狀態
+  const apiKey = ""; // 執行環境會在運行時自動提供 API Key
+  const [aiInsight, setAiInsight] = useState("");
+  const [isGeneratingInsight, setIsGeneratingInsight] = useState(false);
 
   // 取得 Yahoo Finance 資料
   const fetchData = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      // 組合 Yahoo Finance Spark API URL (加入時間戳防止快取)
+      // 組合 Yahoo Finance Spark API URL
+      // 修正：改用 query2 伺服器，並移除時間戳以配合 Proxy 快取機制，降低被阻擋機率
       const symbolsStr = INDICES.map(i => i.symbol).join(',');
-      const yahooUrl = `https://query1.finance.yahoo.com/v7/finance/spark?symbols=${symbolsStr}&_=${Date.now()}`;
+      const yahooUrl = `https://query2.finance.yahoo.com/v7/finance/spark?symbols=${symbolsStr}`;
       
       let json = null;
       
-      try {
-        // 修正：使用 allorigins 的 get 模式 (取代 raw)，將回應包裝在 JSON 中，以繞過瀏覽器嚴格的 CORS 阻擋
-        const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(yahooUrl)}`;
-        const response = await fetch(proxyUrl);
-        if (!response.ok) throw new Error('Primary proxy failed');
-        
-        const proxyData = await response.json();
-        if (!proxyData.contents) throw new Error('Empty contents returned');
-        json = JSON.parse(proxyData.contents);
-      } catch (proxyErr) {
-        console.warn('主要 Proxy 請求失敗，嘗試備用路線...', proxyErr);
-        // 備案：使用另一個穩定的 CORS proxy 服務
-        const fallbackProxyUrl = `https://corsproxy.io/?${encodeURIComponent(yahooUrl)}`;
-        const response2 = await fetch(fallbackProxyUrl);
-        if (!response2.ok) throw new Error('Fallback proxy failed');
-        json = await response2.json();
+      // 更新：提供更穩健的 Proxy 清單，調整編碼方式
+      const proxyStrategies = [
+        {
+          name: 'corsproxy.io',
+          url: `https://corsproxy.io/?${encodeURIComponent(yahooUrl)}`,
+          parse: async (res) => await res.json()
+        },
+        {
+          name: 'codetabs',
+          url: `https://api.codetabs.com/v1/proxy?quest=${yahooUrl}`, // codetabs 對未編碼支援較好
+          parse: async (res) => await res.json()
+        },
+        {
+          name: 'allorigins-get',
+          url: `https://api.allorigins.win/get?url=${encodeURIComponent(yahooUrl)}`,
+          parse: async (res) => {
+            const proxyData = await res.json();
+            if (!proxyData.contents) throw new Error('Empty contents returned');
+            const parsed = JSON.parse(proxyData.contents);
+            // 驗證 allorigins 回傳的是否真的是 Yahoo 的 JSON，避免拿到錯誤 HTML 導致崩潰
+            if (!parsed || !parsed.spark) throw new Error('Not valid Yahoo data');
+            return parsed;
+          }
+        }
+      ];
+
+      // 依序嘗試不同的 Proxy，直到成功為止
+      for (const strategy of proxyStrategies) {
+        try {
+          const response = await fetch(strategy.url, {
+             headers: { 'Accept': 'application/json' }
+          });
+          if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+          
+          const parsedJson = await strategy.parse(response);
+          if (parsedJson?.spark?.result) {
+            json = parsedJson;
+            break; // 成功取得並解析資料，跳出迴圈
+          } else {
+             throw new Error('Invalid JSON structure from proxy');
+          }
+        } catch (proxyErr) {
+          console.warn(`Proxy [${strategy.name}] 失敗:`, proxyErr.message);
+          // 繼續嘗試下一個
+        }
       }
       
-      const results = json?.spark?.result;
-      if (!results) throw new Error('Invalid data format from Yahoo API');
+      if (!json) {
+        throw new Error('所有公開 Proxy 伺服器皆無法連線或被阻擋');
+      }
+      
+      const results = json.spark.result;
       
       const parsedData = INDICES.map(indexInfo => {
         const indexData = results.find(r => r.symbol === indexInfo.symbol);
@@ -76,7 +114,8 @@ export default function App() {
       setUsingMockData(false);
     } catch (err) {
       console.error('Fetch error:', err);
-      setError('無法取得即時資料，目前顯示模擬數據。');
+      // 更新錯誤提示，讓使用者清楚知道是因為公開代理伺服器限制而切換至模擬資料
+      setError('由於跨域代理伺服器限制，目前無法取得即時資料，已自動切換為離線模擬數據。');
       generateMockData(); // 發生錯誤時使用模擬數據以確保畫面有內容
     } finally {
       setLoading(false);
@@ -108,6 +147,60 @@ export default function App() {
     setData(mockData);
     setLastUpdated(new Date());
     setUsingMockData(true);
+  };
+
+  // 呼叫 Gemini API 產生 AI 市場解析
+  const generateAIInsight = async () => {
+    if (!data || data.length === 0) return;
+    setIsGeneratingInsight(true);
+    setAiInsight('');
+
+    // 將目前的報價整理成文字，交給 AI 分析
+    const marketDataStr = data.map(d => 
+      `${d.name} (${d.symbol}): ${d.price.toFixed(2)} (變動: ${d.change > 0 ? '+' : ''}${d.changePercent.toFixed(2)}%)`
+    ).join('\n');
+    
+    const prompt = `你是一位專業的華爾街財經分析師。請根據以下最新的美股四大指數報價，用繁體中文寫一段約 50 到 100 字的市場趨勢簡評。風格要專業且客觀，並加上一點吸引人的開頭。\n\n報價數據：\n${marketDataStr}`;
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+    let retries = 5;
+    let delay = 1000; // 初始延遲 1 秒
+    let success = false;
+    let resultText = '';
+
+    // 實作 Exponential Backoff 錯誤重試機制
+    while (retries > 0 && !success) {
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            systemInstruction: { parts: [{ text: "你是一位專業的繁體中文財經分析師。" }] }
+          })
+        });
+
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        
+        const json = await response.json();
+        resultText = json.candidates?.[0]?.content?.parts?.[0]?.text || '無法生成分析，請稍後再試。';
+        success = true;
+      } catch (err) {
+        retries--;
+        if (retries === 0) {
+          resultText = '目前無法連線到 AI 分析服務，請稍後再試。';
+          console.error('Gemini API Error:', err);
+        } else {
+          // 指數型退避 (1s, 2s, 4s, 8s, 16s)
+          await new Promise(resolve => setTimeout(resolve, delay));
+          delay *= 2; 
+        }
+      }
+    }
+    
+    setAiInsight(resultText);
+    setIsGeneratingInsight(false);
   };
 
   // 初次載入與自動更新設定
@@ -165,6 +258,19 @@ export default function App() {
               自動更新 (30秒)
             </label>
             <div className="w-px h-6 bg-slate-700"></div>
+            
+            {/* 加入 AI 解析按鈕 */}
+            <button 
+              onClick={generateAIInsight}
+              disabled={isGeneratingInsight || data.length === 0}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg font-medium text-sm transition-all ${isGeneratingInsight || data.length === 0 ? 'bg-indigo-500/30 text-indigo-300 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20 active:scale-95'}`}
+              title="使用 Gemini AI 分析目前盤勢"
+            >
+              <Sparkles className={`w-4 h-4 ${isGeneratingInsight ? 'animate-pulse text-indigo-200' : 'text-yellow-300'}`} />
+              {isGeneratingInsight ? '分析中...' : 'AI 盤勢解析 ✨'}
+            </button>
+            <div className="w-px h-6 bg-slate-700"></div>
+
             <button 
               onClick={fetchData}
               disabled={loading}
@@ -181,6 +287,34 @@ export default function App() {
           <div className="mb-6 p-4 bg-red-500/10 border border-red-500/50 rounded-lg text-red-400 flex items-center gap-3">
             <AlertTriangle className="w-5 h-5 flex-shrink-0" />
             <p>{error}</p>
+          </div>
+        )}
+
+        {/* AI 解析顯示區塊 */}
+        {(aiInsight || isGeneratingInsight) && (
+          <div className="mb-8 p-6 bg-gradient-to-br from-indigo-900/40 to-slate-800 border border-indigo-500/30 rounded-xl relative overflow-hidden shadow-lg">
+            <div className="absolute -right-10 -top-10 w-40 h-40 bg-indigo-500/10 rounded-full blur-3xl"></div>
+            <div className="flex items-start gap-4 relative z-10">
+              <div className="p-3 bg-indigo-500/20 border border-indigo-500/30 rounded-xl text-indigo-400 flex-shrink-0">
+                <Bot className="w-6 h-6" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-lg font-bold text-indigo-300 mb-3 flex items-center gap-2">
+                  Gemini AI 即時洞察 ✨
+                </h3>
+                {isGeneratingInsight ? (
+                  <div className="space-y-3 mt-4 animate-pulse">
+                    <div className="h-3 bg-indigo-400/20 rounded w-full"></div>
+                    <div className="h-3 bg-indigo-400/20 rounded w-5/6"></div>
+                    <div className="h-3 bg-indigo-400/20 rounded w-4/6"></div>
+                  </div>
+                ) : (
+                  <p className="text-slate-200 leading-relaxed whitespace-pre-line text-justify">
+                    {aiInsight}
+                  </p>
+                )}
+              </div>
+            </div>
           </div>
         )}
 
